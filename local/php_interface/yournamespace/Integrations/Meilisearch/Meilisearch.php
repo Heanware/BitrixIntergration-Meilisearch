@@ -1,1 +1,216 @@
-<?phpnamespace Yournamespace\Integrations\Meilisearch;use Yournamespace\Catalog\Catalog;use Yournamespace\Constants\EntityType;use Yournamespace\Constants\IblockIds;use Yournamespace\Logs\LogChannels;use Yournamespace\Logs\Logger;use Yournamespace\Mapper\Entities\Course;use Bitrix\Iblock\InheritedProperty\ElementValues;use Bitrix\Main\Loader;use Mapper\Core\Mapper;use Meilisearch\Client;use Meilisearch\Contracts\DocumentsQuery;class Meilisearch{    private static ?Client $client = null;    private static string $indexName = 'catalog';    private static bool $isFirstRun = true;    public static function getClient(): Client    {        if (self::$client === null) {            $httpClient = new CurlClient();            self::$client = new Client(getenv('MEILISEARCH_HOST'), getenv('MEILISEARCH_KEY'), $httpClient);        }        return self::$client;    }    public static function initIndexSettings(): void    {        $index = self::getClient()->index(self::$indexName);        $index->updateSearchableAttributes(['name', 'name_ru', 'name_en','qualification','tags','meta_title']);        $index->updatePagination(['maxTotalHits' => 100]);    }    /**     * @param Course $course     * @return array{id: int, name: string, name_ru: string, name_en: string, qualification: string, tags: array, meta_title: string, url: string|null, type: string, enabled: bool, discount: int, price: float, price_old: float|null, hours: array{min: int, max: int}, breadcrumbs: array}     */    private static function makeArray(Course $course): array    {        $discount = 0;        $price = $course->prices[0]->price;        $oldPrice = $course->prices[0]->oldPrice;        if(!empty($oldPrice)){            $discount = round((($oldPrice - $price) / $oldPrice) * 100);        }        $elementValues = new ElementValues(IblockIds::Catalog, $course->id);        $metaTitle = html_entity_decode($elementValues->getValue('ELEMENT_META_TITLE'));        if(!Loader::includeModule('search')){            \CModule::IncludeModule('search');        }        return [            'id' => $course->id,            'name' => $course->name,            'name_ru' => \CSearchLanguage::ConvertKeyboardLayout($course->name, 'en', 'ru'),            'name_en' => \CSearchLanguage::ConvertKeyboardLayout($course->name, 'ru', 'en'),            'qualification' => $course->qualification ?? '',            'tags' => $course->tags ?? [],            'meta_title' => $metaTitle ?? '',            'url' => $course->isDetailEnabled ? $course->detailPageUrl : null,            'type' => $course->type->value,            'enabled' => $course->isDetailEnabled,            'discount' => $discount,            'price' => $price,            'price_old' => $oldPrice,            'hours' => [                'min' => $course->educationHours,                'max' => $course->educationHours,            ],            'breadcrumbs' => Catalog::GetSectionPath($course->iblockSectionId)        ];    }    public static function BeforeIndex(array $arFields): array    {        if ((int)$arFields['PARAM2'] !== IblockIds::Catalog) {            $arFields['TITLE'] = '';            $arFields['BODY'] = '';            $arFields['TAGS'] = '';            return $arFields;        }        self::updateIndex($arFields);        $arFields['TITLE'] = '';        $arFields['BODY'] = '';        $arFields['TAGS'] = '';        return $arFields;    }    public static function updateIndex(array $arFields): void    {        if($_REQUEST['Reindex'] === 'Y' && self::$isFirstRun){            self::$isFirstRun = false;            self::cleanup();        }        if((int)$arFields['IBLOCK_ID'] !== IblockIds::Catalog){            return;        }        $index = self::getClient()->index(self::$indexName);        self::initIndexSettings();        $courseId = (int)$arFields['ITEM_ID'];        $res = \CIBlockElement::GetList(            [],            ['IBLOCK_ID' => IblockIds::Catalog, 'ID' => $courseId, 'ACTIVE' => 'Y'],            false,            false,            [                'ID',                'NAME',                'IBLOCK_SECTION_ID',                'DETAIL_PAGE_URL',                'TAGS',                'PROPERTY_TYPE',                'PROPERTY_DETAIL_ENABLED',                'PROPERTY_PRICES',                'PROPERTY_EDUCATION_HOURS',                'PROPERTY_QUALIFICATION'            ]        );        if ($arCourse = $res->GetNext(false, false)) {            $course = Mapper::Map(Course::class, $arCourse);            $courseForIndex = [self::makeArray($course)];            $index->addDocuments($courseForIndex);        } else {            $index->deleteDocument($courseId);        }    }    public static function OnBeforeFullReindexClear(): void    {        self::cleanup();    }    public static function cleanup(): void    {        $index = self::getClient()->index(self::$indexName);        $ids = [];        $page = $index->getDocuments((new DocumentsQuery())->setFields(['id'])->setLimit(1000000));        $results = $page->getResults();        foreach ($results as $doc) {            if ($doc['id'] !== null) {                $ids[] = $doc['id'];            }        }        $ids = array_unique($ids);        $courses = Course::orm()            ->where('active', true)            ->select(['id'])            ->all();        $activeCourseIds = array_map(fn($course) => $course->id, $courses);        $idsToDelete = array_values(array_diff($ids, $activeCourseIds));        if (!empty($idsToDelete)) {            $index->deleteDocuments($idsToDelete);        }    }    public static function search(string $text): array    {        $text = trim(mb_strtolower($text));        if (empty($text)) {            return [];        }        try {            $index = self::getClient()->index(self::$indexName);            $search = function($text) use ($index){                return $index->search($text, ['limit' => 100])->getHits();            };            $searchResult = $search($text);            if(!empty($searchResult)){                return $searchResult;            }            \CModule::IncludeModule('search');            $searchResult = $search(\CSearchLanguage::ConvertKeyboardLayout($text, 'en', 'ru'));            if(!empty($searchResult)){                return $searchResult;            }            return $search(\CSearchLanguage::ConvertKeyboardLayout($text, 'ru', 'en'));        } catch (\Throwable $e) {            $logger = Logger::getLogger(LogChannels::Search);            $logger->error('Meilisearch Search SDK Error: ' . $e->getMessage());            return [];        }    }}
+<?php
+namespace Yournamespace\Integrations\Meilisearch;
+
+use Yournamespace\Catalog\Catalog;
+use Yournamespace\Constants\EntityType;
+use Yournamespace\Constants\IblockIds;
+use Yournamespace\Logs\LogChannels;
+use Yournamespace\Logs\Logger;
+use Yournamespace\Mapper\Entities\Course;
+use Bitrix\Iblock\InheritedProperty\ElementValues;
+use Bitrix\Main\Loader;
+use Mapper\Core\Mapper;
+use Meilisearch\Client;
+use Meilisearch\Contracts\DocumentsQuery;
+
+class Meilisearch
+{
+    private static ?Client $client = null;
+    private static string $indexName = 'catalog';
+    private static bool $isFirstRun = true;
+
+    public static function getClient(): Client
+    {
+        if (self::$client === null) {
+            $httpClient = new CurlClient();
+            self::$client = new Client(getenv('MEILISEARCH_HOST'), getenv('MEILISEARCH_KEY'), $httpClient);
+        }
+
+        return self::$client;
+    }
+
+    public static function initIndexSettings(): void
+    {
+        $index = self::getClient()->index(self::$indexName);
+        $index->updateSearchableAttributes(['name', 'name_ru', 'name_en','qualification','tags','meta_title']);
+        $index->updatePagination(['maxTotalHits' => 100]);
+    }
+
+
+    /**
+     * @param Course $course
+     * @return array{id: int, name: string, name_ru: string, name_en: string, qualification: string, tags: array, meta_title: string, url: string|null, type: string, enabled: bool, discount: int, price: float, price_old: float|null, hours: array{min: int, max: int}, breadcrumbs: array}
+     */
+    private static function makeArray(Course $course): array
+    {
+        $discount = 0;
+        $price = $course->prices[0]->price;
+        $oldPrice = $course->prices[0]->oldPrice;
+
+        if(!empty($oldPrice)){
+            $discount = round((($oldPrice - $price) / $oldPrice) * 100);
+        }
+
+        $elementValues = new ElementValues(IblockIds::Catalog, $course->id);
+        $metaTitle = html_entity_decode($elementValues->getValue('ELEMENT_META_TITLE'));
+
+        if(!Loader::includeModule('search')){
+            \CModule::IncludeModule('search');
+        }
+
+        return [
+            'id' => $course->id,
+
+            'name' => $course->name,
+            'name_ru' => \CSearchLanguage::ConvertKeyboardLayout($course->name, 'en', 'ru'),
+            'name_en' => \CSearchLanguage::ConvertKeyboardLayout($course->name, 'ru', 'en'),
+            'qualification' => $course->qualification ?? '',
+            'tags' => $course->tags ?? [],
+            'meta_title' => $metaTitle ?? '',
+
+            'url' => $course->isDetailEnabled ? $course->detailPageUrl : null,
+            'type' => $course->type->value,
+            'enabled' => $course->isDetailEnabled,
+            'discount' => $discount,
+            'price' => $price,
+            'price_old' => $oldPrice,
+            'hours' => [
+                'min' => $course->educationHours,
+                'max' => $course->educationHours,
+            ],
+            'breadcrumbs' => Catalog::GetSectionPath($course->iblockSectionId)
+        ];
+    }
+
+    public static function BeforeIndex(array $arFields): array
+    {
+        if ((int)$arFields['PARAM2'] !== IblockIds::Catalog) {
+            $arFields['TITLE'] = '';
+            $arFields['BODY'] = '';
+            $arFields['TAGS'] = '';
+            return $arFields;
+        }
+
+        self::updateIndex($arFields);
+
+        $arFields['TITLE'] = '';
+        $arFields['BODY'] = '';
+        $arFields['TAGS'] = '';
+
+        return $arFields;
+    }
+
+    public static function updateIndex(array $arFields): void
+    {
+        if($_REQUEST['Reindex'] === 'Y' && self::$isFirstRun){
+            self::$isFirstRun = false;
+            self::cleanup();
+        }
+        if((int)$arFields['IBLOCK_ID'] !== IblockIds::Catalog){
+            return;
+        }
+        $index = self::getClient()->index(self::$indexName);
+        self::initIndexSettings();
+        $courseId = (int)$arFields['ITEM_ID'];
+
+        $res = \CIBlockElement::GetList(
+            [],
+            ['IBLOCK_ID' => IblockIds::Catalog, 'ID' => $courseId, 'ACTIVE' => 'Y'],
+            false,
+            false,
+            [
+                'ID',
+                'NAME',
+                'IBLOCK_SECTION_ID',
+                'DETAIL_PAGE_URL',
+                'TAGS',
+                'PROPERTY_TYPE',
+                'PROPERTY_DETAIL_ENABLED',
+                'PROPERTY_PRICES',
+                'PROPERTY_EDUCATION_HOURS',
+                'PROPERTY_QUALIFICATION'
+            ]
+        );
+
+        if ($arCourse = $res->GetNext(false, false)) {
+            $course = Mapper::Map(Course::class, $arCourse);
+            $courseForIndex = [self::makeArray($course)];
+            $index->addDocuments($courseForIndex);
+        } else {
+            $index->deleteDocument($courseId);
+        }
+    }
+
+    public static function OnBeforeFullReindexClear(): void
+    {
+        self::cleanup();
+    }
+
+    public static function cleanup(): void
+    {
+        $index = self::getClient()->index(self::$indexName);
+
+        $ids = [];
+
+        $page = $index->getDocuments((new DocumentsQuery())->setFields(['id'])->setLimit(1000000));
+        $results = $page->getResults();
+        foreach ($results as $doc) {
+            if ($doc['id'] !== null) {
+                $ids[] = $doc['id'];
+            }
+        }
+
+        $ids = array_unique($ids);
+
+        $courses = Course::orm()
+            ->where('active', true)
+            ->select(['id'])
+            ->all();
+
+        $activeCourseIds = array_map(fn($course) => $course->id, $courses);
+
+        $idsToDelete = array_values(array_diff($ids, $activeCourseIds));
+
+        if (!empty($idsToDelete)) {
+            $index->deleteDocuments($idsToDelete);
+        }
+    }
+
+    public static function search(string $text): array
+    {
+        $text = trim(mb_strtolower($text));
+
+        if (empty($text)) {
+            return [];
+        }
+
+        try {
+            $index = self::getClient()->index(self::$indexName);
+
+            $search = function($text) use ($index){
+                return $index->search($text, ['limit' => 100])->getHits();
+            };
+
+            $searchResult = $search($text);
+
+            if(!empty($searchResult)){
+                return $searchResult;
+            }
+
+            \CModule::IncludeModule('search');
+
+            $searchResult = $search(\CSearchLanguage::ConvertKeyboardLayout($text, 'en', 'ru'));
+
+            if(!empty($searchResult)){
+                return $searchResult;
+            }
+
+            return $search(\CSearchLanguage::ConvertKeyboardLayout($text, 'ru', 'en'));
+
+        } catch (\Throwable $e) {
+            $logger = Logger::getLogger(LogChannels::Search);
+            $logger->error('Meilisearch Search SDK Error: ' . $e->getMessage());
+            return [];
+        }
+    }
+}
